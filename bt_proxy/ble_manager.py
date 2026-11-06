@@ -32,6 +32,13 @@ except ImportError:  # pragma: no cover - older bleak layout
         OrPattern,
     )
 
+try:  # bleak's own dependency on Linux; absent elsewhere, and then we simply
+    # cannot answer "is the adapter powered?" and never pretend to.
+    from dbus_fast import BusType, Message, MessageType
+    from dbus_fast.aio import MessageBus
+except ImportError:  # pragma: no cover - non-BlueZ platforms
+    MessageBus = None  # type: ignore[assignment,misc]
+
 from . import proto
 
 logger = logging.getLogger(__name__)
@@ -45,11 +52,38 @@ CONNECT_TIMEOUT = 30.0
 CONNECT_RETRY_DELAY = 2.0
 CONNECT_MAX_RETRIES = 3
 
+# Total budget for connect_device, retries included. Without it the retry loop
+# runs to CONNECT_MAX_RETRIES * CONNECT_TIMEOUT plus the delays — ~94s — while
+# the client that asked waits far less and then gives up. Every second past the
+# client's own timeout is spent establishing a link nobody will claim, and a
+# connected BLE peripheral stops advertising, so an unclaimed link does not
+# merely waste a slot: it makes the device undiscoverable to every proxy,
+# including this one. A connect that lands after the client has given up hides
+# the device from every proxy until the link is released.
+# It bounds the RETRY LOOP, not an attempt already in flight (bleak's own
+# CONNECT_TIMEOUT does that), so it is the crude half of the fix — the
+# ownership checks below are what actually guarantee nothing is stranded.
+CONNECT_TOTAL_TIMEOUT = 60.0
+
+# How often to sweep for connections whose owner is gone. Ownership, not
+# idleness, is the axis that can be swept safely: a healthy link may sit silent
+# for hours behind a notify subscription, so an idle timer would kill working
+# connections, while an owner that has gone away is a fact.
+ORPHAN_SWEEP_INTERVAL = 30.0
+
+# How long to wait on D-Bus when asking BlueZ which devices are connected.
+BLUEZ_LINKS_QUERY_TIMEOUT = 5.0
+
+# How long to wait on D-Bus when asking BlueZ whether the adapter is powered.
+# Short: the answer is only used to refuse a false "running", and a wedged
+# bluetoothd is exactly when this call hangs, so it must not delay the start.
+ADAPTER_POWER_QUERY_TIMEOUT = 5.0
+
 # Per-device connect-failure backoff. Home Assistant retries failed connections
 # aggressively; without a brake we relay every retry straight to BlueZ and the
-# controller, and that churn can tip a flaky single-radio adapter over the edge
-# (it's what triggered a bluetoothd wedge in testing). Each consecutive failure
-# pushes the next allowed attempt out (linear, capped); a success clears it.
+# controller, and that churn can tip a flaky single-radio adapter over the edge —
+# far enough to wedge bluetoothd. Each consecutive failure pushes the next allowed
+# attempt out (linear, capped); a success clears it.
 CONNECT_FAIL_BACKOFF_STEP = 5.0
 CONNECT_FAIL_BACKOFF_MAX = 60.0
 # A connect that "succeeds" instantly but isn't really connected (a phantom
@@ -64,15 +98,37 @@ DAEMON_WEDGE_BACKOFF = 120.0
 # gentle attempts, releasing the stale session between them, rather than either
 # crashing (a supervisor restart-loop hammers a flaky adapter) or retrying in a
 # tight loop. A persistent failure usually means the controller is wedged at the
-# HCI level (dmesg "hci0: Opcode 0x200c failed"), which only an adapter reset
-# clears — so we stop and report FAILED instead of flooding it with more scan
-# commands.
+# HCI level (dmesg "hci0: Opcode 0x200c failed"), which a driver re-probe
+# clears — see the error text in start_scanning — so we stop
+# and report FAILED instead of flooding it with more scan commands.
 SCAN_START_MAX_RETRIES = 3
 SCAN_START_RETRY_DELAY = 2.0
 # While the scanner is down we re-arm it on a slow, single-attempt cadence so it
 # self-heals from a transient failure (or a manual adapter reset) without
 # hammering the controller.
 SCAN_REARM_INTERVAL = 60.0
+
+# A scanner that BlueZ ACCEPTED is not a scanner that is working. StartDiscovery can
+# return success while the controller delivers nothing at all: a controller whose firmware
+# handshake fails ("Reading QCA version information failed (-110)") still accepts the call,
+# and so does one whose single discovery session another scanner stack has taken over.
+# Setting `_scanning` from the start call alone therefore makes a dead radio
+# indistinguishable from a quiet one — the proxy reports RUNNING, the re-arm loop exits
+# satisfied, and nothing further is logged. So liveness is measured from advertisements
+# arriving, not from the API call returning: if none arrive for this long while we believe
+# we are scanning, tear the scanner down and re-arm it. Generous by default — anywhere with
+# BLE traffic sees a stray advertisement every few seconds, but a genuinely isolated site
+# might not. 0 disables the watchdog.
+ADVERT_SILENCE_TIMEOUT = 300.0
+ADVERT_WATCHDOG_INTERVAL = 30.0
+
+# bleak's "no RSSI in this advertisement" sentinel. It is also a legal (very weak) reading,
+# which is exactly why it must not be forwarded as one — see BLEManager._usable_rssi.
+RSSI_UNKNOWN = -127
+# How long a real reading stands in for a missing one. Short: RSSI is only useful while it
+# still describes where the device is.
+RSSI_CACHE_TTL = 60.0
+RSSI_DROP_LOG_EVERY = 500
 
 # Passive scanning via the BlueZ AdvertisementMonitor1 D-Bus interface needs
 # BlueZ >= 5.56 (and the daemon started with --experimental). On older BlueZ
@@ -383,11 +439,41 @@ def _bleak_props_to_int(properties: list[str]) -> int:
 class BLEManager:
     """Manages BLE scanning and active connections."""
 
-    def __init__(self, max_connections: int = 3, adapter: str | None = None):
+    def __init__(
+        self,
+        max_connections: int = 3,
+        adapter: str | None = None,
+        advert_timeout: float = ADVERT_SILENCE_TIMEOUT,
+    ):
         self.max_connections = max_connections
         self._adapter = adapter
         self._connections: dict[int, BLEConnection] = {}
         self._connecting: set[int] = set()
+        # Who asked for each link. A GATT link exists because some API client
+        # requested it; when that client goes away the link must go with it,
+        # or it lingers holding the device off the air. Keyed by address, same
+        # as _connections, and set BEFORE the connect starts so there is no
+        # window in which a live link has no recorded owner.
+        self._owners: dict[int, Any] = {}
+        # Is this owner still around? Supplied by the API server, which is the
+        # only thing that knows. None means "cannot tell", and we then never
+        # reap — a sweeper that guesses is worse than no sweeper.
+        self._owner_is_live: Callable[[Any], bool] | None = None
+        # Addresses whose in-flight connect has been cancelled (the requester
+        # disconnected, or went away, while we were still retrying). The retry
+        # loop checks this rather than pressing on to hand back a link that
+        # nobody is waiting for any more.
+        self._connect_cancelled: set[int] = set()
+        self._orphan_sweep_task: asyncio.Task | None = None
+        # Every address this process has asked BlueZ to connect. The sweeper
+        # releases a link BlueZ holds only if it is in here: a link we never
+        # asked for belongs to something else on the host (a bonded phone, a
+        # second daemon sharing the adapter) and is never ours to drop.
+        self._touched: set[int] = set()
+        # Untracked links seen on the previous sweep. A link is released on its
+        # second consecutive sighting, so a connect or disconnect that BlueZ
+        # and our bookkeeping are momentarily out of step on is left alone.
+        self._untracked_seen: set[int] = set()
         # Per-device connect-failure backoff: address -> (fail_count, next_ts).
         # Throttles reconnect storms so we don't hammer a flaky controller.
         self._connect_backoff: dict[int, tuple[int, float]] = {}
@@ -408,6 +494,14 @@ class BLEManager:
         self._scanning = False
         # Background task that slowly re-arms the scanner after a failed start.
         self._scan_rearm_task: asyncio.Task | None = None
+        # Advertisement watchdog: proves the scanner is actually receiving, not just
+        # that BlueZ accepted the start call. See ADVERT_SILENCE_TIMEOUT.
+        self._advert_timeout = advert_timeout
+        self._last_advert = 0.0
+        self._advert_watchdog_task: asyncio.Task | None = None
+        # address -> (last real rssi, monotonic time), to stand in when BlueZ omits it.
+        self._rssi_cache: dict[str, tuple[int, float]] = {}
+        self._rssi_dropped = 0
         self._adv_callback: Callable[
             [int, int, int, bytes], None
         ] | None = None
@@ -441,6 +535,11 @@ class BLEManager:
         self, device: BLEDevice, advertisement_data: AdvertisementData
     ) -> None:
         """Called by BleakScanner for each advertisement."""
+        # The watchdog's only evidence that the radio is alive. Stamped before the
+        # early return below, so a proxy with no client attached still counts as
+        # receiving rather than looking silent.
+        self._last_advert = time.monotonic()
+
         # Cache the BLEDevice object for use in connections
         self._device_cache[device.address.upper()] = device
 
@@ -461,9 +560,52 @@ class BLEManager:
             elif hasattr(details, "address_type"):
                 address_type = getattr(details, "address_type", 0)
 
-        rssi = advertisement_data.rssi if advertisement_data.rssi else -127
+        rssi = self._usable_rssi(device.address.upper(), advertisement_data.rssi)
+        if rssi is None:
+            return
 
         self._adv_callback(address_int, rssi, address_type, raw_data)
+
+    def _usable_rssi(self, address: str, reported: int | None) -> int | None:
+        """Return an RSSI worth forwarding, or None to drop the advertisement.
+
+        BlueZ does not always attach an RSSI. In passive mode especially, an
+        AdvertisementMonitor update can arrive with no RSSI property at all, and bleak
+        fills in its RSSI_UNKNOWN sentinel (-127). This is common, not a rare edge:
+        a large fraction of passive-mode advertisements can arrive that way.
+
+        Forwarding the sentinel is the worst of the three options: -127 is a legal, very
+        weak reading, so Home Assistant stores it as the signal from this scanner, and
+        anything deriving range from it — the integrations that turn proxy RSSI into
+        distance and area, and HA's own choice of which proxy is nearest — concludes the
+        device is far away. A device sitting beside the proxy is placed somewhere else
+        entirely, and nothing anywhere looks like an error.
+
+        So: use the reported value when it is real; otherwise carry the last real one for
+        this address forward if it is recent enough to still mean something; otherwise drop
+        the advertisement. Dropping loses the payload, which is a genuine cost for a device
+        that only ever reports without an RSSI — but a proxied advertisement with no signal
+        strength cannot be placed, and a silent lie about position is worse than a gap.
+        """
+        if reported is not None and reported != RSSI_UNKNOWN:
+            # `is not None` plus an explicit sentinel test, not a truthiness check:
+            # `rssi if rssi else -127` would rewrite a *valid* 0 dBm reading — the
+            # strongest signal there is — into the weakest one.
+            self._rssi_cache[address] = (reported, time.monotonic())
+            return reported
+
+        cached = self._rssi_cache.get(address)
+        if cached is not None and time.monotonic() - cached[1] <= RSSI_CACHE_TTL:
+            return cached[0]
+
+        self._rssi_dropped += 1
+        if self._rssi_dropped % RSSI_DROP_LOG_EVERY == 1:
+            logger.warning(
+                f"Dropped {self._rssi_dropped} advertisement(s) with no RSSI from BlueZ "
+                f"(most recently {address}). These cannot be positioned, and forwarding "
+                f"the {RSSI_UNKNOWN} sentinel would read as a real, very weak signal."
+            )
+        return None
 
     async def start_scanning(self) -> None:
         """Start BLE scanning.
@@ -538,22 +680,106 @@ class BLEManager:
                     f"Could not start BLE scanner after {SCAN_START_MAX_RETRIES} "
                     f"attempts: {e}. The Bluetooth controller may be wedged at "
                     f"the HCI level (look for 'hci0: Opcode 0x200c failed' in "
-                    f"dmesg); if so only an adapter reset clears it, e.g. 'sudo "
-                    f"hciconfig {adapter} reset' (or 'sudo hciconfig {adapter} "
-                    f"down && sudo hciconfig {adapter} up', or reboot) — "
-                    f"restarting bluetoothd is not enough. Will re-try every "
-                    f"{int(SCAN_REARM_INTERVAL)}s."
+                    f"dmesg). To recover, re-probe the driver: unbind then "
+                    f"bind the device under /sys/bus/serial/drivers/<drv>/ "
+                    f"(no delay needed between the two). Powering "
+                    f"{adapter} back on does not clear this state. "
+                    f"Will re-try every {int(SCAN_REARM_INTERVAL)}s."
                 )
-            await self._teardown_scanner()
-            self._scanning = False
-            if self._scanner_state_callback:
-                self._scanner_state_callback(proto.SCANNER_STATE_FAILED)
-            self._schedule_scan_rearm()
+            await self._fail_scanner_start()
+            return
+
+        # A start that returned cleanly is not proof of a working radio — see
+        # _adapter_powered. Refuse to report RUNNING for an unpowered one.
+        if await self._adapter_powered() is False:
+            adapter = self._adapter or "hci0"
+            logger.error(
+                f"BLE scanner start reported success but {adapter} is NOT "
+                f"POWERED, so it cannot receive anything — refusing to report "
+                f"this proxy as running. BlueZ accepts the request and then "
+                f"rejects the advertisement monitor with "
+                f"MGMT_STATUS_NOT_POWERED, which never reaches us. To recover, "
+                f"re-probe the driver on the host: 'echo <dev> | sudo "
+                f"tee /sys/bus/serial/drivers/<drv>/unbind' then the same to "
+                f"'bind'. Will re-try every {int(SCAN_REARM_INTERVAL)}s."
+            )
+            await self._fail_scanner_start()
             return
 
         self._scanning = True
+        # Give the fresh scanner a full silence budget before the watchdog may judge it.
+        self._last_advert = time.monotonic()
+        self._start_advert_watchdog()
+        # Connections outlive any single scan session — set_scan_mode stops and
+        # restarts the scanner under live links — so the sweeper starts here
+        # (idempotently, before any connect is possible) and is cancelled only
+        # by cleanup(), never by stop_scanning().
+        self._start_orphan_sweeper()
         if self._scanner_state_callback:
             self._scanner_state_callback(proto.SCANNER_STATE_RUNNING)
+
+    async def _fail_scanner_start(self) -> None:
+        """Tear down, report FAILED to the client, and re-arm slowly.
+
+        Shared by both ways a start can fail: an exception from BlueZ, and a
+        start that "succeeded" against an adapter that is not powered.
+        """
+        await self._teardown_scanner()
+        self._scanning = False
+        if self._scanner_state_callback:
+            self._scanner_state_callback(proto.SCANNER_STATE_FAILED)
+        self._schedule_scan_rearm()
+
+    async def _adapter_powered(self) -> bool | None:
+        """Is the controller actually powered? None when we cannot tell.
+
+        This exists because a scanner start is not proof of a working radio.
+        BlueZ accepts a passive-scan request against an unpowered adapter and
+        then refuses to register the advertisement monitor —
+        `Failed to Add Adv Patterns Monitor with status 0x0a`
+        (MGMT_STATUS_NOT_POWERED) — and that refusal never reaches the client.
+        bleak's start() returns cleanly, so without this check the proxy
+        reports RUNNING for a radio that can never deliver an advertisement,
+        and Home Assistant goes on routing connections to it. Unchecked, a dead
+        controller goes on looking healthy indefinitely.
+
+        Best-effort by design: any failure to ask returns None, and a None
+        never blocks a scanner that is otherwise working.
+        """
+        if MessageBus is None:
+            return None
+        adapter = self._adapter or "hci0"
+        bus = None
+        try:
+            bus = await asyncio.wait_for(
+                MessageBus(bus_type=BusType.SYSTEM).connect(),
+                timeout=ADAPTER_POWER_QUERY_TIMEOUT,
+            )
+            reply = await asyncio.wait_for(
+                bus.call(
+                    Message(
+                        destination="org.bluez",
+                        path=f"/org/bluez/{adapter}",
+                        interface="org.freedesktop.DBus.Properties",
+                        member="Get",
+                        signature="ss",
+                        body=["org.bluez.Adapter1", "Powered"],
+                    )
+                ),
+                timeout=ADAPTER_POWER_QUERY_TIMEOUT,
+            )
+            if reply is None or reply.message_type is MessageType.ERROR:
+                return None
+            return bool(reply.body[0].value)
+        except Exception as e:
+            logger.debug("Could not read adapter power state: %s", e)
+            return None
+        finally:
+            if bus is not None:
+                try:
+                    bus.disconnect()
+                except Exception:
+                    pass
 
     async def _start_scanner(self, passive: bool) -> None:
         """Create and start a BleakScanner in the given mode."""
@@ -615,6 +841,62 @@ class BLEManager:
         except Exception:
             pass
 
+    def _start_advert_watchdog(self) -> None:
+        """Ensure a single watchdog task is checking that advertisements arrive."""
+        if self._advert_timeout <= 0:
+            return
+        if self._advert_watchdog_task is None or self._advert_watchdog_task.done():
+            self._advert_watchdog_task = asyncio.ensure_future(
+                self._advert_watchdog_loop()
+            )
+
+    def _cancel_advert_watchdog(self) -> None:
+        task = self._advert_watchdog_task
+        self._advert_watchdog_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _advert_watchdog_loop(self) -> None:
+        """Tear the scanner down if it stops receiving while claiming to run.
+
+        `start_scanning` sets `_scanning` when StartDiscovery succeeds, which on its own
+        leaves a controller that accepted the call and then delivered nothing
+        indistinguishable from a healthy one — to this process, to Home Assistant, and to
+        anything downstream reading the proxy's scanner state. This is what tells them
+        apart.
+
+        On a trip we report FAILED (so the client stops trusting this proxy) and hand
+        over to the ordinary re-arm loop rather than restarting here, keeping one recovery
+        path instead of two. If the controller is wedged at the HCI level the re-arm will
+        keep failing loudly, which is the correct outcome — that needs an adapter reset,
+        not a retry.
+        """
+        try:
+            while True:
+                await asyncio.sleep(ADVERT_WATCHDOG_INTERVAL)
+                if not self._scanning or self._advert_timeout <= 0:
+                    continue
+                silent_for = time.monotonic() - self._last_advert
+                if silent_for < self._advert_timeout:
+                    continue
+                adapter = self._adapter or "hci0"
+                logger.error(
+                    f"No BLE advertisement in {int(silent_for)}s while the scanner "
+                    f"reported running — the controller has stopped receiving. "
+                    f"Tearing the scanner down and re-arming every "
+                    f"{int(SCAN_REARM_INTERVAL)}s. If this repeats, {adapter} is wedged "
+                    f"and needs an adapter reset (see the start-failure message); "
+                    f"--advert-timeout 0 disables this check."
+                )
+                await self._teardown_scanner()
+                self._scanning = False
+                if self._scanner_state_callback:
+                    self._scanner_state_callback(proto.SCANNER_STATE_FAILED)
+                self._schedule_scan_rearm()
+                return
+        finally:
+            self._advert_watchdog_task = None
+
     def _schedule_scan_rearm(self) -> None:
         """Ensure a single background task is slowly re-arming the scanner."""
         if self._scan_rearm_task is None or self._scan_rearm_task.done():
@@ -625,10 +907,10 @@ class BLEManager:
     async def _scan_rearm_loop(self) -> None:
         """Slowly retry scanner start until it succeeds (gentle self-heal).
 
-        One attempt per interval — deliberately not a tight loop: if the
-        controller is wedged only an adapter reset will help, and hammering it
-        just floods the logs and keeps it busy. This does mean recovery from a
-        manual `hciconfig reset` happens within one interval.
+        One attempt per interval — deliberately not a tight loop: a wedged
+        controller needs the driver re-probed on the host, which this cannot
+        do, and hammering it just floods the logs and keeps it busy. So
+        recovery from that host-side rebind lands within one interval.
         """
         try:
             while not self._scanning:
@@ -684,6 +966,9 @@ class BLEManager:
             return
 
         logger.info("Stopping BLE scanner")
+        # A deliberate stop (shutdown, or the mode switch in set_scan_mode) must not look
+        # like a silent radio to the watchdog.
+        self._cancel_advert_watchdog()
         if self._scanner_state_callback:
             self._scanner_state_callback(proto.SCANNER_STATE_STOPPING)
 
@@ -705,6 +990,7 @@ class BLEManager:
     def _handle_disconnect(self, address: int) -> None:
         """Internal disconnect handler."""
         conn = self._connections.pop(address, None)
+        self._owners.pop(address, None)
         if conn:
             # Schedule BlueZ cleanup in background
             asyncio.ensure_future(self._bluez_clear_state(conn.mac))
@@ -738,8 +1024,9 @@ class BLEManager:
                     f"Connect to {mac} is failing like bluetoothd is wedged "
                     f"(phantom connection / no D-Bus reply). This usually needs "
                     f"the daemon restarted on the host: 'sudo systemctl restart "
-                    f"bluetooth' (if that doesn't help, also reset the adapter: "
-                    f"'sudo hciconfig {adapter} reset'). Backing off "
+                    f"bluetooth'. If that doesn't help, {adapter} needs its "
+                    f"DRIVER re-probed (unbind/bind under /sys/bus/serial/"
+                    f"drivers/). Backing off "
                     f"{int(delay)}s between attempts until it recovers."
                 )
         else:
@@ -751,14 +1038,21 @@ class BLEManager:
             f"{error} (next attempt blocked for {int(delay)}s)"
         )
 
-    async def connect_device(self, address: int) -> tuple[bool, int, int]:
-        """Connect to a BLE device.
+    async def connect_device(
+        self, address: int, owner: Any = None
+    ) -> tuple[bool, int, int]:
+        """Connect to a BLE device on behalf of ``owner``.
 
         Returns (success, mtu, error_code).
 
         Scanning is left running throughout — BlueZ interleaves discovery and
         connection establishment itself, so there's no need to stop the scanner
         (and toggling it per connect just churns the adapter).
+
+        ``owner`` is an opaque token identifying the API client that asked, so
+        the link can be released when that client goes away. A link established
+        after its requester has stopped waiting is never kept: it is torn down
+        before returning, because holding it would silence the device.
         """
         if len(self._connections) >= self.max_connections:
             logger.warning("No free connection slots")
@@ -789,6 +1083,8 @@ class BLEManager:
             return False, 0, -1
 
         self._connecting.add(address)
+        self._connect_cancelled.discard(address)
+        self._touched.add(address)
 
         try:
             # Look up cached BLEDevice from scanner
@@ -798,11 +1094,19 @@ class BLEManager:
                 address, self._handle_disconnect, self._handle_notify
             )
             self._connections[address] = conn
+            self._owners[address] = owner
 
+            deadline = time.monotonic() + CONNECT_TOTAL_TIMEOUT
             last_error: Exception | None = None
             for attempt in range(1, CONNECT_MAX_RETRIES + 1):
                 try:
                     await conn.connect(ble_device)
+                    if not await self._keep_or_drop(address, conn):
+                        # Nobody is waiting for this any more. Reported as a
+                        # failure because that is what it is from the caller's
+                        # side, but no backoff is armed: the radio did nothing
+                        # wrong, we were simply too late.
+                        return False, 0, -1
                     # Success clears any backoff and the wedge latch.
                     self._connect_backoff.pop(address, None)
                     self._daemon_wedge_logged = False
@@ -818,6 +1122,24 @@ class BLEManager:
                         err_str,
                     )
                     if attempt >= CONNECT_MAX_RETRIES:
+                        break
+                    if address in self._connect_cancelled:
+                        logger.info(
+                            "Abandoning connect to %s: the requester is gone",
+                            mac,
+                        )
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= CONNECT_RETRY_DELAY:
+                        logger.warning(
+                            "Giving up on %s after %.0fs: out of connect budget "
+                            "(%.0fs) with %d/%d attempts made",
+                            mac,
+                            CONNECT_TOTAL_TIMEOUT - remaining,
+                            CONNECT_TOTAL_TIMEOUT,
+                            attempt,
+                            CONNECT_MAX_RETRIES,
+                        )
                         break
                     if _is_daemon_wedge_error(e):
                         # Retrying a wedged daemon just churns (and bluetoothctl
@@ -838,10 +1160,57 @@ class BLEManager:
 
             # All retries exhausted — record the failure and arm the backoff.
             self._note_connect_failure(address, mac, last_error)
-            self._connections.pop(address, None)
+            self._forget(address)
             return False, 0, -1
         finally:
             self._connecting.discard(address)
+            self._connect_cancelled.discard(address)
+
+    def _forget(self, address: int) -> None:
+        """Drop every trace of a connection that is no longer live."""
+        self._connections.pop(address, None)
+        self._owners.pop(address, None)
+
+    async def _keep_or_drop(self, address: int, conn: BLEConnection) -> bool:
+        """Decide whether a just-established link is still wanted.
+
+        Two ways it may not be. The requester can have cancelled while we were
+        retrying; or a disconnect can have arrived mid-loop and already retired
+        this connection, in which case the entry under ``address`` is no longer
+        ours. The second case is the dangerous one — the retry loop holds its
+        own reference, so without this check it would go on to return a live
+        link that the manager no longer tracks at all: invisible to
+        free_connections, to the sweeper, and to cleanup() at shutdown, and
+        therefore held until the process dies.
+        """
+        current = self._connections.get(address)
+        if current is not None and current is not conn:
+            # Another BLEConnection now owns this address. The _connecting guard
+            # is supposed to make that impossible, and we cannot disconnect ours
+            # without dropping the shared link to the same device, so say so and
+            # leave both alone rather than guess.
+            logger.error(
+                "Refusing to reconcile %s: a different connection object holds "
+                "it. Report this — the in-progress guard should prevent it.",
+                conn.mac,
+            )
+            return False
+
+        cancelled = address in self._connect_cancelled
+        if current is conn and not cancelled:
+            return True
+
+        logger.info(
+            "Dropping just-established link to %s: %s",
+            conn.mac,
+            "the requester cancelled" if cancelled else "it was already retired",
+        )
+        try:
+            await conn.disconnect()
+        except Exception as e:
+            logger.warning("Failed to drop link to %s: %s", conn.mac, e)
+        self._forget(address)
+        return False
 
     async def _bluez_clear_state(self, mac: str) -> None:
         """Disconnect a device in BlueZ to clear stale connection state."""
@@ -869,12 +1238,210 @@ class BLEManager:
             pass
 
     async def disconnect_device(self, address: int) -> None:
-        """Disconnect from a BLE device."""
+        """Disconnect from a BLE device.
+
+        Safe to call while a connect is still retrying: the in-flight attempt
+        is marked cancelled so the loop stops instead of completing and handing
+        back a link the caller has already given up on.
+        """
+        if address in self._connecting:
+            self._connect_cancelled.add(address)
         conn = self._connections.pop(address, None)
+        self._owners.pop(address, None)
         if conn:
             await conn.disconnect()
             # Also clear BlueZ state to prevent InProgress on next connect
             await self._bluez_clear_state(conn.mac)
+
+    def set_owner_liveness(self, is_live: Callable[[Any], bool]) -> None:
+        """Teach the manager how to ask whether an owner is still around."""
+        self._owner_is_live = is_live
+
+    async def release_owner(self, owner: Any) -> None:
+        """Disconnect every link held on behalf of ``owner``.
+
+        Called when an API client goes away. Deterministic and immediate; the
+        sweeper below is only the backstop for whatever this misses.
+        """
+        addresses = [
+            addr for addr, held in self._owners.items() if held is owner
+        ]
+        for address in addresses:
+            logger.info(
+                "Releasing %s: its requester disconnected",
+                proto.int_to_mac(address),
+            )
+            await self.disconnect_device(address)
+
+    def _orphaned_addresses(self) -> list[int]:
+        """Live links whose owner has provably gone away."""
+        if self._owner_is_live is None:
+            return []
+        orphans = []
+        for address in list(self._connections):
+            if address in self._connecting:
+                # Still being established; the connect path owns the decision.
+                continue
+            owner = self._owners.get(address)
+            if owner is None or not self._owner_is_live(owner):
+                orphans.append(address)
+        return orphans
+
+    async def sweep_orphans(self) -> int:
+        """Disconnect links nobody owns. Returns how many were released."""
+        released = 0
+        for address in self._orphaned_addresses():
+            logger.warning(
+                "Sweeping orphaned link to %s — it has no owner and a connected "
+                "device stops advertising, so leaving it would hide the device",
+                proto.int_to_mac(address),
+            )
+            try:
+                await self.disconnect_device(address)
+                released += 1
+            except Exception as e:
+                logger.warning("Failed to sweep %s: %s", address, e)
+        return released
+
+    async def _bluez_connected(self) -> dict[int, str] | None:
+        """Addresses BlueZ holds a link to on our adapter -> their object path.
+
+        None when BlueZ cannot be asked. The caller then releases nothing: the
+        same rule as the ownership sweep, where liveness that cannot be
+        determined is never guessed at.
+        """
+        if MessageBus is None:
+            return None
+        prefix = f"/org/bluez/{self._adapter or 'hci0'}/dev_"
+        bus = None
+        try:
+            bus = await asyncio.wait_for(
+                MessageBus(bus_type=BusType.SYSTEM).connect(),
+                timeout=BLUEZ_LINKS_QUERY_TIMEOUT,
+            )
+            reply = await asyncio.wait_for(
+                bus.call(
+                    Message(
+                        destination="org.bluez",
+                        path="/",
+                        interface="org.freedesktop.DBus.ObjectManager",
+                        member="GetManagedObjects",
+                    )
+                ),
+                timeout=BLUEZ_LINKS_QUERY_TIMEOUT,
+            )
+            if reply is None or reply.message_type is MessageType.ERROR:
+                return None
+            connected: dict[int, str] = {}
+            for path, interfaces in reply.body[0].items():
+                device = interfaces.get("org.bluez.Device1")
+                if device is None or not path.startswith(prefix):
+                    continue
+                if not device.get("Connected") or not device["Connected"].value:
+                    continue
+                address = device.get("Address")
+                if address is not None:
+                    connected[proto.mac_to_int(address.value)] = path
+            return connected
+        except Exception as e:
+            logger.debug("Could not list BlueZ's connected devices: %s", e)
+            return None
+        finally:
+            if bus is not None:
+                try:
+                    bus.disconnect()
+                except Exception:
+                    pass
+
+    async def _bluez_disconnect(self, path: str) -> None:
+        """Ask BlueZ to drop the link to the device at ``path``."""
+        bus = await asyncio.wait_for(
+            MessageBus(bus_type=BusType.SYSTEM).connect(),
+            timeout=BLUEZ_LINKS_QUERY_TIMEOUT,
+        )
+        try:
+            reply = await asyncio.wait_for(
+                bus.call(
+                    Message(
+                        destination="org.bluez",
+                        path=path,
+                        interface="org.bluez.Device1",
+                        member="Disconnect",
+                    )
+                ),
+                timeout=BLUEZ_LINKS_QUERY_TIMEOUT,
+            )
+            if reply is not None and reply.message_type is MessageType.ERROR:
+                raise RuntimeError(reply.body[0] if reply.body else reply.error_name)
+        finally:
+            bus.disconnect()
+
+    async def sweep_untracked_links(self) -> int:
+        """Release links BlueZ holds that this process asked for and has forgotten.
+
+        The ownership sweep reads our own bookkeeping, so it cannot see the one
+        link that bookkeeping has already let go of: a connect that timed out
+        here is forgotten here, while BlueZ may go on to complete it. Nothing
+        then tracks the link, no client owns it, and the peripheral stops
+        advertising to every proxy until it is power-cycled or the link is
+        released, even while switched on and in range. An untracked link
+        cannot be confirmed as the cause from the outside, which is why BlueZ is
+        asked what is actually connected rather than inferred from.
+
+        Two guards keep this from dropping a link that is wanted. Only an
+        address this process itself tried to connect is ever released, and
+        only on its second consecutive sighting, a sweep interval apart.
+        Returns how many links were released.
+        """
+        connected = await self._bluez_connected()
+        if connected is None:
+            self._untracked_seen.clear()
+            return 0
+        untracked = {
+            address
+            for address in connected
+            if address in self._touched
+            and address not in self._connections
+            and address not in self._connecting
+        }
+        released = 0
+        for address in untracked & self._untracked_seen:
+            mac = proto.int_to_mac(address)
+            logger.warning(
+                "Releasing untracked link to %s — BlueZ holds a connection this "
+                "proxy asked for and no longer tracks, and a connected device "
+                "stops advertising, so leaving it would hide the device",
+                mac,
+            )
+            try:
+                await self._bluez_disconnect(connected[address])
+                released += 1
+            except Exception as e:
+                logger.warning("Failed to release untracked link to %s: %s", mac, e)
+        self._untracked_seen = untracked
+        return released
+
+    async def _orphan_sweep_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(ORPHAN_SWEEP_INTERVAL)
+                await self.sweep_orphans()
+                await self.sweep_untracked_links()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("Orphan sweep failed: %s", e)
+
+    def _start_orphan_sweeper(self) -> None:
+        if self._orphan_sweep_task is None:
+            self._orphan_sweep_task = asyncio.ensure_future(
+                self._orphan_sweep_loop()
+            )
+
+    def _cancel_orphan_sweeper(self) -> None:
+        if self._orphan_sweep_task is not None:
+            self._orphan_sweep_task.cancel()
+            self._orphan_sweep_task = None
 
     def get_connection(self, address: int) -> BLEConnection | None:
         """Get an active connection by address."""
@@ -888,12 +1455,15 @@ class BLEManager:
         if self._scan_rearm_task is not None:
             self._scan_rearm_task.cancel()
             self._scan_rearm_task = None
+        self._cancel_advert_watchdog()
+        self._cancel_orphan_sweeper()
         for conn in list(self._connections.values()):
             try:
                 await conn.disconnect()
             except Exception:
                 pass
         self._connections.clear()
+        self._owners.clear()
         await self.stop_scanning()
 
 

@@ -1,3 +1,10 @@
+> **This is a fork of [denvera/bt-proxy](https://github.com/denvera/bt-proxy).** It measures the scanner's liveness from advertisements actually arriving rather than from BlueZ accepting the discovery call, so a controller that wedges after a successful start is torn down and reported failed instead of being listed as a healthy proxy; and it never forwards BlueZ's -127 no-RSSI sentinel as a real reading, carrying the last real value forward briefly and otherwise dropping the advertisement, so nothing downstream computes a distance from a signal that was never measured.
+> Read branch **`scanner-liveness`**; `main` mirrors upstream unchanged.
+> Changes meant for upstream are prepared as patch series against `main`.
+>
+> **The README below is upstream's**, with this fork's changes folded in where they apply.
+> Its install and image instructions point at upstream and will not give you the changes
+> above. To run this fork: `git clone -b scanner-liveness https://github.com/pete-jorgensen/bt-proxy.git`.
 # bt-proxy
 
 ESPHome-compatible Bluetooth Proxy for Raspberry Pi.
@@ -42,6 +49,7 @@ uv run python -m bt_proxy
 | `--port` | `6053` | API server TCP port |
 | `--max-connections` | `3` | Max concurrent BLE GATT connections |
 | `--adapter` | system default | Bluetooth adapter (e.g. `hci0`) |
+| `--advert-timeout` | `300` | Seconds of advertisement silence that count as a dead scanner. `0` disables the watchdog |
 | `--log-level` | `INFO` | Logging verbosity |
 
 ### Example
@@ -49,6 +57,118 @@ uv run python -m bt_proxy
 ```bash
 uv run python -m bt_proxy --name living-room-proxy --friendly-name "Living Room BT Proxy" --log-level DEBUG
 ```
+
+### Scanner liveness
+
+A controller can accept `StartDiscovery` and then deliver nothing — a firmware handshake
+that times out leaves BlueZ reporting a healthy adapter that never produces an
+advertisement. Trusting the start call therefore makes a dead radio indistinguishable from
+a quiet one: the proxy keeps reporting as running and Home Assistant goes on counting it
+among its Bluetooth sources.
+
+Liveness is measured from advertisements arriving instead. Every detection stamps a
+monotonic timestamp; a watchdog checks every 30 s and, after `--advert-timeout` seconds of
+silence while the scanner is supposed to be running, tears the scanner down and reports
+`SCANNER_STATE_FAILED` so the client stops trusting this proxy, then hands over to the
+existing re-arm loop. The timestamp is stamped before the no-client early return, so a
+proxy nobody has connected to still counts as receiving, and a deliberate stop — shutdown,
+or the stop/start inside a scan-mode change — cancels the watchdog so a mode switch cannot
+look like a dead radio.
+
+Set `--advert-timeout 0` only where no BLE device is expected to advertise within the
+window; on a site with any traffic at all it disables the one check that notices this
+failure.
+
+### A started scanner is not a working radio
+
+Two independent ways the proxy can look healthy while receiving nothing, and the check
+for each:
+
+**The controller accepts and then delivers nothing.** Covered by the advertisement
+watchdog above.
+
+**The adapter is not powered at all.** BlueZ accepts a passive-scan request against an
+unpowered controller and then refuses to register the advertisement monitor —
+`Failed to Add Adv Patterns Monitor with status 0x0a` (MGMT_STATUS_NOT_POWERED) — and that
+refusal never reaches the client. bleak's `start()` returns cleanly. So the adapter's
+`Powered` property is read over D-Bus after a successful start, and the proxy reports
+`SCANNER_STATE_FAILED` rather than `RUNNING` when it is false. The query is best-effort:
+if it cannot be answered (no dbus-fast, no D-Bus, a timeout) the result is "cannot tell"
+and never blocks a scanner that is otherwise working.
+
+Without this, a proxy whose controller has died reports as running indefinitely, and Home
+Assistant goes on routing connections to it.
+
+⚠️ **Re-probing its serdev driver brings a wedged UART controller back** — unbind, then
+bind, with no delay needed between the two writes. Powering the adapter back on through
+rfkill, `bluetoothctl` or `hciconfig` does not recover this state. `<dev>` is the serdev
+device and `<drv>` its driver under `/sys/bus/serial/drivers/`:
+
+```bash
+echo <dev> | sudo tee /sys/bus/serial/drivers/<drv>/unbind
+echo <dev> | sudo tee /sys/bus/serial/drivers/<drv>/bind
+```
+
+### Connection ownership
+
+Every GATT link exists because some client asked for it, and it is released when that
+client goes away. Without that, a link can outlive the request that created it — and a
+connected BLE peripheral stops advertising, so a stranded link does not merely occupy a
+slot: it makes the device undiscoverable to every proxy, including the one holding it.
+The failure is self-perpetuating, because the run that strands the link is the same kind of
+run that then cannot find the device.
+
+Four rules keep it from happening:
+
+- **A connect is bounded.** The retry loop stops at `CONNECT_TOTAL_TIMEOUT` (60 s) rather
+  than running to `CONNECT_MAX_RETRIES * CONNECT_TIMEOUT` plus delays, which is ~94 s —
+  longer than any client waits.
+- **A link that arrives too late is dropped.** If the requester cancelled while the connect
+  was in flight, or the connection was already retired, the established link is disconnected
+  before returning rather than kept. A disconnect arriving mid-retry also stops the loop
+  instead of letting it complete.
+- **A link with no owner is swept.** Losing a client releases its links immediately; a
+  sweeper every `ORPHAN_SWEEP_INTERVAL` (30 s) is the backstop for anything that misses.
+
+- **A link this process asked for and no longer tracks is released.** The three rules
+  above all read the proxy's own bookkeeping, so none of them can see the one link that
+  bookkeeping has already let go of: a connect that times out here is forgotten here, while
+  BlueZ may still complete it. Each sweep therefore also asks BlueZ what is really
+  connected, and drops any link that (a) this process itself once tried to connect,
+  (b) it has no entry for and is not currently connecting, and (c) was in that state on the
+  previous sweep too. A link the proxy never asked for — a bonded phone, another daemon on
+  the same adapter — is never touched, and if BlueZ cannot be asked nothing is released.
+  This case is worth the extra sweep: a connect that gives up and is forgotten here can
+  still complete in BlueZ, and the peripheral then stays connected — and silent to every
+  proxy — until something releases the link. An untracked link cannot be confirmed from
+  the outside, which is why the sweep asks BlueZ rather than inferring.
+
+The sweeper keys on **ownership, not idleness**. A healthy link behind a notify subscription
+can sit silent for hours, so an idle timer would disconnect working connections; an owner
+that has gone away is a fact rather than a guess. Where liveness cannot be determined at
+all, nothing is swept.
+
+Diagnosing a stranded link on the host, if one is ever suspected:
+
+```bash
+bluetoothctl info <MAC>        # Connected: yes, while no scan can see the device
+bluetoothctl disconnect <MAC>  # it advertises again within ~3 s
+```
+
+### RSSI
+
+BlueZ does not always attach an RSSI. In passive mode an advertisement can arrive with no
+RSSI property, and bleak fills in `-127`. That value is also a legal, very weak reading, so
+forwarding it is not a null: Home Assistant stores it as this scanner's signal for the
+device, and anything computing range from it — distance and area sensors, Home Assistant's
+own choice of nearest proxy — concludes the device is far away, with nothing looking like
+an error anywhere.
+
+The reported value is used when it is real; otherwise this address's last real reading is
+carried forward while it is under 60 s old; otherwise the advertisement is dropped. Dropping
+loses the payload, which is a real cost for a device that only ever reports without an RSSI,
+but an advertisement that cannot be positioned is of little use to a proxy and a gap beats a
+confident wrong position. Drops are counted and logged every 500 so the cost is visible.
 
 ## How It Works
 
@@ -270,4 +390,17 @@ bt_proxy/
 ├── proto.py           # Protobuf encoding/decoding, message IDs, wire protocol
 ├── ble_manager.py     # BLE scanning and GATT connections (bleak)
 └── api_server.py      # ESPHome Native API TCP server
+
+tests/                 # pytest; a fake bleak client, no radio needed
 ```
+
+## Tests
+
+```bash
+pip install -e '.[test]'
+pytest
+```
+
+The suite covers the connection lifecycle — who owns a link, and what happens to one that
+arrives after its requester has gone. Those are races, so the fake client can be held
+mid-connect rather than timed with sleeps.

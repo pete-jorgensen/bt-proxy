@@ -230,7 +230,17 @@ class APIConnection:
             proto.BLE_REQUEST_CONNECT_V3_WITH_CACHE,
             proto.BLE_REQUEST_CONNECT_V3_WITHOUT_CACHE,
         ):
-            success, mtu, error = await ble.connect_device(address)
+            success, mtu, error = await ble.connect_device(address, owner=self)
+            if success and self._closed:
+                # We lost the client while connecting. Nothing will ever claim
+                # this link, and a connected peripheral stops advertising, so
+                # keeping it would hide the device from every proxy.
+                logger.info(
+                    "Client gone before connect to %s completed; releasing it",
+                    proto.int_to_mac(address),
+                )
+                await ble.disconnect_device(address)
+                return
             resp = proto.encode_ble_device_connection_response(
                 address, success, mtu, error
             )
@@ -522,6 +532,13 @@ class APIConnection:
         if self._adv_flush_task:
             self._adv_flush_task.cancel()
             self._adv_flush_task = None
+        # Release the GATT links we asked for. They exist only to serve this
+        # client; left behind they hold their devices off the air, invisible to
+        # the proxy that would otherwise re-discover them.
+        try:
+            await self.server.ble_manager.release_owner(self)
+        except Exception as e:
+            logger.warning("Failed to release BLE links on cleanup: %s", e)
         try:
             self.writer.close()
             await self.writer.wait_closed()
@@ -588,6 +605,9 @@ class APIServer:
             on_notify=self._on_notify,
             on_scanner_state=self._on_scanner_state,
         )
+        # The server is the only thing that knows whether a client is still
+        # around, so it answers that question for the manager's orphan sweeper.
+        self.ble_manager.set_owner_liveness(self.is_live_connection)
 
         self._server = await asyncio.start_server(
             self._handle_client, "0.0.0.0", self.port
@@ -606,6 +626,14 @@ class APIServer:
                 await asyncio.wait_for(self._server.wait_closed(), timeout=5.0)
             except asyncio.TimeoutError:
                 logger.warning("Timed out waiting for API server to close")
+
+    def is_live_connection(self, owner: Any) -> bool:
+        """Is this owner still a client of ours?
+
+        Anything that is not one of our current connections is gone, including
+        a token from a previous process or a link nobody ever claimed.
+        """
+        return any(conn is owner and not conn._closed for conn in self._connections)
 
     def remove_connection(self, conn: APIConnection) -> None:
         """Remove a connection from the active list."""
