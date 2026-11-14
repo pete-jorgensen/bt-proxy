@@ -99,8 +99,8 @@ and never blocks a scanner that is otherwise working.
 Without this, a proxy whose controller has died reports as running indefinitely, and Home
 Assistant goes on routing connections to it.
 
-⚠️ **Re-probing its serdev driver brings a wedged UART controller back** — unbind, then
-bind, with no delay needed between the two writes. Powering the adapter back on through
+**A wedged UART-attached controller recovers when its serdev driver is re-probed**:
+unbind it, then bind it. No delay is needed between the two writes. Powering the adapter back on through
 rfkill, `bluetoothctl` or `hciconfig` does not recover this state. `<dev>` is the serdev
 device and `<drv>` its driver under `/sys/bus/serial/drivers/`:
 

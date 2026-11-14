@@ -53,9 +53,8 @@ async def test_connect_that_lands_after_the_requester_gave_up_is_dropped(
     """A link established after its requester left must not be kept.
 
     Two attempts fail. The requester gives up *while the third is in flight* —
-    past every cancellation check the loop makes, with the two failures landing
-    tens of seconds before the client stops waiting and the successful connect
-    arriving after it. The link that arrives must not be kept.
+    past every cancellation check the loop makes. The link that arrives must not
+    be kept.
     """
     monkeypatch.setattr(ble_manager, "CONNECT_RETRY_DELAY", 0.0)
     fake_bleak.fail_first = 2

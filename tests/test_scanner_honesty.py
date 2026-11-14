@@ -15,6 +15,7 @@ never refuse a working one.
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -151,3 +152,96 @@ async def test_power_query_cannot_hang_the_start(manager, monkeypatch):
 
     result = await asyncio.wait_for(manager._adapter_powered(), timeout=2.0)
     assert result is None
+
+
+# --- advertisement watchdog -------------------------------------------------
+
+
+@pytest.fixture
+def fast_watchdog(monkeypatch):
+    """Check every 10 ms instead of every 30 s."""
+    monkeypatch.setattr(ble_manager, "ADVERT_WATCHDOG_INTERVAL", 0.01)
+
+
+async def test_silent_scanner_is_torn_down_and_re_armed(
+    manager, monkeypatch, fast_watchdog
+):
+    """No advertisements for the timeout: report FAILED and hand to re-arm."""
+    rearmed = []
+    monkeypatch.setattr(
+        ble_manager.BLEManager,
+        "_schedule_scan_rearm",
+        lambda self: rearmed.append(True),
+    )
+    manager._advert_timeout = 0.05
+    rec = wire(manager, powered=True)
+
+    await manager.start_scanning()
+    assert rec.states[-1] == proto.SCANNER_STATE_RUNNING
+
+    await asyncio.sleep(0.2)
+
+    assert rec.states[-1] == proto.SCANNER_STATE_FAILED
+    assert manager._scanning is False
+    assert manager._scanner is None
+    assert rearmed, "the watchdog tripped but nothing re-arms the scanner"
+
+
+async def test_advertisements_keep_the_scanner_running(manager, fast_watchdog):
+    """The half that must not regress: a receiving scanner is left alone."""
+    manager._advert_timeout = 0.05
+    rec = wire(manager, powered=True)
+
+    await manager.start_scanning()
+    for _ in range(20):
+        manager._last_advert = time.monotonic()
+        await asyncio.sleep(0.01)
+
+    assert proto.SCANNER_STATE_FAILED not in rec.states
+    assert manager._scanning is True
+    await manager.stop_scanning()
+
+
+async def test_deliberate_stop_is_not_a_dead_radio(manager, fast_watchdog):
+    """Stopping the scanner cancels the watchdog; silence after it is expected."""
+    manager._advert_timeout = 0.05
+    rec = wire(manager, powered=True)
+
+    await manager.start_scanning()
+    await manager.stop_scanning()
+    await asyncio.sleep(0.2)
+
+    assert proto.SCANNER_STATE_FAILED not in rec.states
+    assert manager._advert_watchdog_task is None
+
+
+async def test_scan_mode_switch_keeps_exactly_one_watchdog(manager, fast_watchdog):
+    """The stop/start inside set_scan_mode must leave a live watchdog behind.
+
+    The cancelled watchdog finishes after its replacement has started; it must
+    not clear the replacement's handle on the way out.
+    """
+    manager._advert_timeout = 60
+    wire(manager, powered=True)
+
+    await manager.start_scanning()
+    first = manager._advert_watchdog_task
+    await asyncio.sleep(0.02)  # let it run into its first sleep
+    await manager.set_scan_mode(not manager._scan_active)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    task = manager._advert_watchdog_task
+    assert first.done()
+    assert task is not None and task is not first and not task.done()
+    await manager.stop_scanning()
+
+
+async def test_timeout_zero_disables_the_watchdog(manager, fast_watchdog):
+    manager._advert_timeout = 0
+    wire(manager, powered=True)
+
+    await manager.start_scanning()
+
+    assert manager._advert_watchdog_task is None
+    assert manager._scanning is True

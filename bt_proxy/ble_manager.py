@@ -61,8 +61,8 @@ CONNECT_MAX_RETRIES = 3
 # including this one. A connect that lands after the client has given up hides
 # the device from every proxy until the link is released.
 # It bounds the RETRY LOOP, not an attempt already in flight (bleak's own
-# CONNECT_TIMEOUT does that), so it is the crude half of the fix — the
-# ownership checks below are what actually guarantee nothing is stranded.
+# CONNECT_TIMEOUT does that); the ownership checks below are what guarantee
+# nothing is stranded.
 CONNECT_TOTAL_TIMEOUT = 60.0
 
 # How often to sweep for connections whose owner is gone. Ownership, not
@@ -110,8 +110,8 @@ SCAN_REARM_INTERVAL = 60.0
 
 # A scanner that BlueZ ACCEPTED is not a scanner that is working. StartDiscovery can
 # return success while the controller delivers nothing at all: a controller whose firmware
-# handshake fails ("Reading QCA version information failed (-110)") still accepts the call,
-# and so does one whose single discovery session another scanner stack has taken over.
+# handshake has timed out still accepts the call, and so does one whose single discovery
+# session is held by another scanner stack on the same adapter.
 # Setting `_scanning` from the start call alone therefore makes a dead radio
 # indistinguishable from a quiet one — the proxy reports RUNNING, the re-arm loop exits
 # satisfied, and nothing further is logged. So liveness is measured from advertisements
@@ -895,7 +895,10 @@ class BLEManager:
                 self._schedule_scan_rearm()
                 return
         finally:
-            self._advert_watchdog_task = None
+            # Only clear our own handle: a cancelled watchdog can finish after a
+            # restart has already started its replacement.
+            if self._advert_watchdog_task is asyncio.current_task():
+                self._advert_watchdog_task = None
 
     def _schedule_scan_rearm(self) -> None:
         """Ensure a single background task is slowly re-arming the scanner."""
